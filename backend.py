@@ -305,7 +305,47 @@ reranker = CrossEncoder("BAAI/bge-reranker-base")
 import torch
 
 
+# =========================================================
+# DEBUG HELPERS (instrumentation only - no business logic changes)
+# =========================================================
+DEBUG_MODE = True
+DEBUG_CONTENT_PREVIEW = 1200
+
+def _debug_header(title):
+    if not DEBUG_MODE: return
+    print("\n" + "=" * 120)
+    print(f"DEBUG | {title}")
+    print("=" * 120)
+
+def _debug_value(label, value):
+    if DEBUG_MODE: print(f"DEBUG | {label}: {value}")
+
+def _debug_doc(doc, index=None, score=None, score_label=None, full_content=False):
+    if not DEBUG_MODE: return
+    print("-" * 120)
+    print(f"DEBUG | Document {index if index is not None else ''}")
+    if score is not None: print(f"DEBUG | {score_label or 'score'}: {score}")
+    print(f"DEBUG | metadata: {getattr(doc, 'metadata', None)}")
+    content = getattr(doc, 'page_content', '')
+    print("DEBUG | content:")
+    print(content if full_content else content[:DEBUG_CONTENT_PREVIEW])
+
+def _debug_state_snapshot(state, keys=None, title="STATE SNAPSHOT"):
+    if not DEBUG_MODE: return
+    _debug_header(title)
+    for key in (keys or list(state.keys())):
+        print(f"DEBUG | state[{key!r}] = {state.get(key)}")
+
 def rerank(question, docs, top_k=None, threshold=0.8):
+
+    _debug_header("RERANK START")
+    _debug_value("rerank query", question)
+    _debug_value("candidate document count", len(docs))
+    _debug_value("rerank threshold", threshold)
+    _debug_value("requested top_k", top_k)
+    if DEBUG_MODE:
+        for i, doc in enumerate(docs, start=1):
+            _debug_doc(doc, index=i)
 
     pairs = [
         (question, doc.page_content)
@@ -335,6 +375,16 @@ def rerank(question, docs, top_k=None, threshold=0.8):
         key=lambda x: float(x[2]),
         reverse=True
     )
+
+    if DEBUG_MODE:
+        _debug_header("RERANK SCORES BEFORE THRESHOLD")
+        for i, (doc, raw_score, sigmoid_score) in enumerate(ranked, start=1):
+            decision = "PASS" if float(sigmoid_score) >= threshold else "FAIL"
+            print(f"DEBUG | Rank {i} | {decision} | Raw logit={float(raw_score):.6f} | Sigmoid={float(sigmoid_score):.6f} | Threshold={threshold}")
+            _debug_doc(doc, index=i)
+        passed_count = sum(float(s) >= threshold for _, _, s in ranked)
+        _debug_value("documents passing threshold", passed_count)
+        _debug_value("documents failing threshold", len(ranked)-passed_count)
 
     # -----------------------------
     # Apply threshold
@@ -1469,6 +1519,7 @@ def merge_node(state: Routine_Filling) -> dict:
 # ===== Source notebook cell 72 =====
 def Orchestrator_Node(state: Routine_Filling) -> dict:
     print("Orchestrator Node Called")
+    _debug_state_snapshot(state, ["current_question","extracted_information","skin_type","skin_concern","pregnancy","products_mentioned"], "ORCHESTRATOR INPUT")
 
     system_prompt = """
 You are the Orchestrator of a multi-agent skincare system.
@@ -1840,11 +1891,24 @@ Do not create duplicate tasks for the same agent.
         temperature=0
     )
 
+    if DEBUG_MODE:
+        _debug_header("ORCHESTRATOR RAW LLM OUTPUT")
+        print(response.choices[0].message.content)
+
     response = json.loads(
         response.choices[0].message.content
     )
 
     selected_agents = response["agent_tasks"]
+    if DEBUG_MODE:
+        _debug_header("ORCHESTRATOR PARSED TASKS")
+        for i, task in enumerate(selected_agents, start=1):
+            print(f"DEBUG | Task {i}: {task}")
+            if task.get("agent") == "scientific_rag_node": print(f"DEBUG | Scientific retrieval query: {task.get('query')}")
+            if task.get("agent") == "safety_node": print(f"DEBUG | Safety checks: {task.get('safety_checks')}")
+            if task.get("agent") == "product_recommender_node":
+                print(f"DEBUG | Product reference: {task.get('product_reference')}")
+                print(f"DEBUG | Required product information: {task.get('required_information')}")
 
     print("selected_agents")
     print(selected_agents)
@@ -1889,6 +1953,13 @@ def scientific_rag_node(state: Routine_Filling):
 
     print("Scientific Retrieval Query:")
     print(original_question)
+    _debug_header("SCIENTIFIC RAG INPUT")
+    _debug_value("user/current question", state.get("current_question"))
+    _debug_value("orchestrator scientific task", scientific_task)
+    _debug_value("scientific retrieval query", original_question)
+    _debug_value("MIN_RERANK_SCORE", MIN_RERANK_SCORE)
+    _debug_value("RETRIEVAL_K", RETRIEVAL_K)
+    _debug_value("concerns metadata filter", concerns)
 
 
     # =========================================================
@@ -1904,6 +1975,12 @@ def scientific_rag_node(state: Routine_Filling):
     # If no matching metadata exists, search whole KB
     if not useful_docs:
         useful_docs = splited_docs
+
+    if DEBUG_MODE:
+        _debug_header("SCIENTIFIC METADATA PRE-FILTER")
+        _debug_value("documents available in splited_docs", len(splited_docs))
+        _debug_value("documents after metadata pre-filter", len(useful_docs))
+        for i, doc in enumerate(useful_docs, start=1): _debug_doc(doc, index=i)
 
 
     bm25 = BM25Retriever.from_documents(
@@ -1951,6 +2028,12 @@ def scientific_rag_node(state: Routine_Filling):
     if semantic_filter:
         vector_kwargs["filter"] = semantic_filter
 
+    if DEBUG_MODE:
+        _debug_header("SCIENTIFIC RETRIEVER CONFIG")
+        _debug_value("semantic_filter", semantic_filter)
+        _debug_value("vector search kwargs", vector_kwargs)
+        _debug_value("hybrid weights", [0.2, 0.8])
+
 
     hybrid_retriever = EnsembleRetriever(
         retrievers=[
@@ -1969,9 +2052,25 @@ def scientific_rag_node(state: Routine_Filling):
     # 5. Retrieve candidate documents
     # =========================================================
 
+    if DEBUG_MODE:
+        _debug_header("SCIENTIFIC BM25 DEBUG RETRIEVAL")
+        try:
+            debug_bm25_docs = bm25.invoke(original_question)
+            for i, doc in enumerate(debug_bm25_docs, start=1): _debug_doc(doc, index=i)
+        except Exception as exc: print(f"DEBUG | BM25 debug retrieval failed: {exc}")
+        _debug_header("SCIENTIFIC VECTOR DEBUG RETRIEVAL")
+        try:
+            debug_vector_results = Routine_Agent_vectorstore.similarity_search_with_score(original_question, **vector_kwargs)
+            print("DEBUG | FAISS value below is native FAISS score/distance, NOT reranker sigmoid score.")
+            for i, (doc, sc) in enumerate(debug_vector_results, start=1): _debug_doc(doc, i, float(sc), "FAISS native score/distance")
+        except Exception as exc: print(f"DEBUG | Vector debug retrieval failed: {exc}")
+
     retrieved_docs = hybrid_retriever.invoke(
         original_question
     )
+    if DEBUG_MODE:
+        _debug_header("SCIENTIFIC HYBRID RETRIEVAL - BEFORE DEDUP")
+        for i, doc in enumerate(retrieved_docs, start=1): _debug_doc(doc, index=i)
 
 
     # =========================================================
@@ -1999,6 +2098,9 @@ def scientific_rag_node(state: Routine_Filling):
         f"Retrieved {len(retrieved_docs)} "
         f"unique candidate documents"
     )
+    if DEBUG_MODE:
+        _debug_header("SCIENTIFIC HYBRID RETRIEVAL - AFTER DEDUP")
+        for i, doc in enumerate(retrieved_docs, start=1): _debug_doc(doc, index=i)
 
 
     # =========================================================
@@ -2345,11 +2447,24 @@ def product_recommender_node(state: Routine_Filling):
 
         product_name = prod["product_name"]
 
+        if DEBUG_MODE:
+            _debug_header("PRODUCT RECOMMENDER NAME MATCH")
+            _debug_value("original product name", product_name)
+            debug_product_match = process.extractOne(
+                product_name,
+                PRODUCT_NAMES,
+                scorer=fuzz.WRatio
+            )
+            _debug_value("RapidFuzz match result", debug_product_match)
+
         product_name = process.extractOne(
             product_name,
             PRODUCT_NAMES,
             scorer=fuzz.WRatio
         )[0]
+
+        if DEBUG_MODE:
+            _debug_value("matched DB product name", product_name)
 
         for req in required_information:
             query = f"""
@@ -2365,6 +2480,11 @@ def product_recommender_node(state: Routine_Filling):
             )
 
             product_returned = cursor.fetchone()
+            if DEBUG_MODE:
+                _debug_header("PRODUCT DB QUERY RESULT")
+                _debug_value("requested field", req)
+                _debug_value("resolved product", product_name)
+                _debug_value("SQL result", product_returned)
 
             if not product_returned:
                 information_output.append(
@@ -2666,6 +2786,13 @@ def safety_node(state: Routine_Filling):
     safety_queries = []
 
     ingredients_text = ", ".join(ingredients)
+    if DEBUG_MODE:
+        _debug_header("SAFETY QUERY BUILDER INPUT")
+        _debug_value("ingredients", ingredients)
+        _debug_value("safety_checks", safety_checks)
+        _debug_value("skin_type", skin_type)
+        _debug_value("pregnancy", pregnancy)
+        _debug_value("allergies", allergies)
 
     if (
         "pregnancy" in safety_checks
@@ -2722,6 +2849,10 @@ def safety_node(state: Routine_Filling):
     # 4. If no safety query can be built
     # --------------------------------------------------
 
+    if DEBUG_MODE:
+        _debug_header("SAFETY QUERIES BUILT")
+        for i, query in enumerate(safety_queries, start=1): print(f"DEBUG | Safety Query {i}: {query}")
+
     if not safety_queries:
 
         print("No safety queries could be built")
@@ -2754,6 +2885,11 @@ def safety_node(state: Routine_Filling):
         for doc in splited_docs
         if doc.metadata.get("skinconcern") == "safety"
     ]
+
+    if DEBUG_MODE:
+        _debug_header("SAFETY RETRIEVAL POOL")
+        _debug_value("safety pool document count", len(useful_docs))
+        for i, doc in enumerate(useful_docs, start=1): _debug_doc(doc, index=i)
 
     if not useful_docs:
 
@@ -2811,7 +2947,26 @@ def safety_node(state: Routine_Filling):
         print("\nSafety retrieval query:")
         print(query)
 
+        if DEBUG_MODE:
+            _debug_header("SAFETY RETRIEVAL - CURRENT QUERY")
+            _debug_value("query", query)
+            _debug_value("MIN_RET_THRESHOLD", MIN_RET_THRESHOLD)
+            _debug_value("RETRIEVAL_K", RETRIEVAL_K)
+            try:
+                debug_bm25_docs = bm25.invoke(query)
+                _debug_header("SAFETY BM25 DEBUG RETRIEVAL")
+                for i, doc in enumerate(debug_bm25_docs, start=1): _debug_doc(doc, index=i)
+            except Exception as exc: print(f"DEBUG | Safety BM25 debug retrieval failed: {exc}")
+            try:
+                debug_vector_results = Routine_Agent_vectorstore.similarity_search_with_score(query, k=RETRIEVAL_K, filter=semantic_filter)
+                _debug_header("SAFETY VECTOR DEBUG RETRIEVAL")
+                for i,(doc,sc) in enumerate(debug_vector_results,start=1): _debug_doc(doc,i,float(sc),"FAISS native score/distance")
+            except Exception as exc: print(f"DEBUG | Safety vector debug retrieval failed: {exc}")
+
         retrieved_docs = hybrid_retriever.invoke(query)
+        if DEBUG_MODE:
+            _debug_header("SAFETY HYBRID RETRIEVAL")
+            for i, doc in enumerate(retrieved_docs, start=1): _debug_doc(doc, index=i)
 
         reranked_docs, scores = rerank(
             query,
@@ -2998,6 +3153,7 @@ def ask_missing_info(missing_inputs):
 # ===== Source notebook cell 102 =====
 def routine_router_node(state : Routine_Filling):
     print("routine_router_node")
+    _debug_state_snapshot(state, ["current_agent_index","required_agents","scientific_answer","products_mentioned","Ingredients_to_check","safety_response"], "ROUTINE ROUTER STATE")
     order_priority={
         "scientific_rag_node":0,
         "product_recommender_node":1,
@@ -3073,6 +3229,11 @@ def final_synthesizer(state: Routine_Filling):
         )
 
     combined_responses = "\n\n".join(agent_responses)
+    if DEBUG_MODE:
+        _debug_header("FINAL SYNTHESIZER INPUT")
+        _debug_value("user_question", user_question)
+        print("DEBUG | combined agent responses:")
+        print(combined_responses)
 
 
     system_prompt = f"""
